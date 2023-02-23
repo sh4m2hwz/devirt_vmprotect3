@@ -68,6 +68,7 @@ def init_triton_dse(mu):
     ctx.setMode(MODE.ALIGNED_MEMORY, True)
     ctx.setMode(MODE.AST_OPTIMIZATIONS, True)
     ctx.setMode(MODE.CONSTANT_FOLDING, True)
+    ctx.setMode(MODE.SYMBOLIZE_INDEX_ROTATION, True)
     ctx.setConcreteRegisterValue(ctx.registers.rax,mu.reg_read(UC_X86_REG_RAX))
     ctx.setConcreteRegisterValue(ctx.registers.rcx,mu.reg_read(UC_X86_REG_RCX))
     ctx.setConcreteRegisterValue(ctx.registers.rdx,mu.reg_read(UC_X86_REG_RDX))
@@ -120,84 +121,15 @@ def symbolizeMemIfContainsBaseReg(mu,ctx,insn,reg,reg_id):
                     address = mu.reg_read(reg_id)
                     mem_access = MemoryAccess(address, op.getSize())
                     print("[*] symbolizing mem",mem_access)
+                    ctx.clearConcreteMemoryValue(mem_access)
                     ctx.symbolizeMemory(mem_access,f"mem_{reg.getName()}_{hex(address)[2:]}")
+                    ctx.setTaintMemory(mem_access, True)
+
 
 handle_address = 0
 pop_regs = []
 pco_reg = None
-def hook_insn(mu, address, size, ctx):
-    global pco_reg
-    global pop_regs
-    global handle_address
-    if len(pop_regs) == 16:
-        print("[+] found vmexit\n[+] done emulation")
-        mu.emu_stop()
-        return
-    if handle_address == 0:
-        handle_address = address
-    insn = Instruction(address,bytes(mu.mem_read(address,size+1)))
-    ctx.processing(insn)
-    print(f"{hex(insn.getAddress())}: {insn.getDisassembly()}")
-    opcode = insn.getType()
-    if opcode == OPCODE.X86.RET:
-        if not pco_reg:
-            print("[+] found not explorated branch\n[+] done emulation")    
-            mu.emu_stop()
-            return
-        disasm_line,llvm_ir = deobfuscate_reg_trace(ctx,pco_reg,handle_address,insn)
-        print("[*] check if exists..")        
-        if os.path.exists(f"hdl_{hex(handle_address)[2:]}/"):
-            print("[-] found element, skipping")
-        else:
-            print("[+] saving to handles array")
-            os.mkdir(f"hdl_{hex(handle_address)[2:]}/")
-            with open(f"hdl_{hex(handle_address)[2:]}/hdl_{hex(handle_address)[2:]}.asm",'w') as f: f.write(disasm_line)
-            with open(f"hdl_{hex(handle_address)[2:]}/hdl_{hex(handle_address)[2:]}.ll",'w') as f: f.write(llvm_ir)
-        ctx.reset()
-        pop_regs.clear()
-        handle_address = 0
-        pco_reg = None
-        ctx = init_triton_dse(mu)
-        return
-    else:
-        pco_reg = None
-    try:
-        op1 = insn.getOperands()[0]
-    except:
-        return
-    
-    if opcode == OPCODE.X86.JMP and op1.getType() == OPERAND.REG:
-        disasm_line,llvm_ir = deobfuscate_reg_trace(ctx,op1,handle_address,insn)
-        print("[*] check if exists..")        
-        if os.path.exists(f"hdl_{hex(handle_address)[2:]}/"):
-            print("[-] found element, skipping")
-        else:
-            print("[+] saving to handles array")
-            os.mkdir(f"hdl_{hex(handle_address)[2:]}/")
-            with open(f"hdl_{hex(handle_address)[2:]}/hdl_{hex(handle_address)[2:]}.asm",'w') as f: f.write(disasm_line)
-            with open(f"hdl_{hex(handle_address)[2:]}/hdl_{hex(handle_address)[2:]}.ll",'w') as f: f.write(llvm_ir)
-        ctx.reset()
-        pop_regs.clear()
-        handle_address = 0
-        ctx = init_triton_dse(mu)
-    elif opcode == OPCODE.X86.PUSH and op1.getType() == OPERAND.REG:
-        pco_reg = op1
-        for reg in pop_regs:
-            if reg == op1.getName():
-                pop_regs.remove(reg)
-    elif opcode == OPCODE.X86.POP and op1.getType()  == OPERAND.REG:
-        print("[+] found ",insn.getDisassembly())
-        for reg in pop_regs:
-            if reg == op1.getName():
-                return
-        pop_regs.append(op1.getName())
 
-
-def hook_mem_access(mu, access, address, size, value, ctx):
-    if access == UC_MEM_WRITE:
-        ctx.setConcreteMemoryAreaValue(address, bytes(mu.mem_read(address,size)))
-
-   
 def symbolize_mem_hook_insn(mu, address, size, ctx):
     global pco_reg
     global pop_regs
@@ -233,12 +165,89 @@ def symbolize_mem_hook_insn(mu, address, size, ctx):
             if reg == op1.getName():
                 pop_regs.remove(reg)
     elif opcode == OPCODE.X86.POP and op1.getType()  == OPERAND.REG:
+        print("[+] found",insn.getDisassembly())
+        for reg in pop_regs:
+            if reg == op1.getName():
+                return
+        pop_regs.append(op1.getName())
+
+def hook_insn(mu, address, size, ctx):
+    global pco_reg
+    global pop_regs
+    global handle_address
+    if len(pop_regs) == 16:
+        print("[+] found vmexit\n[+] done emulation")
+        mu.emu_stop()
+        return
+    if handle_address == 0:
+        handle_address = address
+    insn = Instruction(address,bytes(mu.mem_read(address,size+1)))
+    ctx.processing(insn)
+    print(f"{hex(insn.getAddress())}: {insn.getDisassembly()}")
+    opcode = insn.getType()
+    if opcode == OPCODE.X86.RET:
+        if not pco_reg:
+            print("[+] found not explorated branch\n[+] done emulation")    
+            mu.emu_stop()
+            return
+        disasm_line,llvm_ir = deobfuscate_reg_trace(ctx,pco_reg,handle_address,insn)
+        print("[*] check if exists..")
+        if os.path.exists(f"hdl_{hex(handle_address)[2:]}/"):
+            print("[-] found element, skipping")
+        else:
+            print("[+] saving to handles array")
+            os.mkdir(f"hdl_{hex(handle_address)[2:]}/")
+            with open(f"hdl_{hex(handle_address)[2:]}/hdl_{hex(handle_address)[2:]}.asm",'w') as f: f.write(disasm_line)
+            with open(f"hdl_{hex(handle_address)[2:]}/hdl_{hex(handle_address)[2:]}.ll",'w') as f: f.write(llvm_ir)
+        ctx.reset()
+        pop_regs.clear()
+        handle_address = 0
+        pco_reg = None
+        ctx = init_triton_dse(mu)
+        sym_vars_mu, rip = load_binary()
+        sym_vars_mu.hook_add(UC_HOOK_CODE, symbolize_mem_hook_insn, ctx)
+        sym_vars_mu.emu_start(begin=rip, until=-1)
+        return
+    else:
+        pco_reg = None
+    try:
+        op1 = insn.getOperands()[0]
+    except:
+        return
+    
+    if opcode == OPCODE.X86.JMP and op1.getType() == OPERAND.REG:
+        disasm_line,llvm_ir = deobfuscate_reg_trace(ctx,op1,handle_address,insn)
+        print("[*] check if exists..")        
+        if os.path.exists(f"hdl_{hex(handle_address)[2:]}/"):
+            print("[-] found element, skipping")
+        else:
+            print("[+] saving to handles array")
+            os.mkdir(f"hdl_{hex(handle_address)[2:]}/")
+            with open(f"hdl_{hex(handle_address)[2:]}/hdl_{hex(handle_address)[2:]}.asm",'w') as f: f.write(disasm_line)
+            with open(f"hdl_{hex(handle_address)[2:]}/hdl_{hex(handle_address)[2:]}.ll",'w') as f: f.write(llvm_ir)
+        ctx.reset()
+        pop_regs.clear()
+        handle_address = 0
+        ctx = init_triton_dse(mu)
+        sym_vars_mu, rip = load_binary()
+        sym_vars_mu.hook_add(UC_HOOK_CODE, symbolize_mem_hook_insn, ctx)
+        sym_vars_mu.emu_start(begin=rip, until=-1)
+    elif opcode == OPCODE.X86.PUSH and op1.getType() == OPERAND.REG:
+        pco_reg = op1
+        for reg in pop_regs:
+            if reg == op1.getName():
+                pop_regs.remove(reg)
+    elif opcode == OPCODE.X86.POP and op1.getType()  == OPERAND.REG:
         print("[+] found ",insn.getDisassembly())
         for reg in pop_regs:
             if reg == op1.getName():
                 return
         pop_regs.append(op1.getName())
 
+
+def hook_mem_access(mu, access, address, size, value, ctx):
+    if access == UC_MEM_WRITE:
+        ctx.setConcreteMemoryAreaValue(address, bytes(mu.mem_read(address,size)))
 
 sym_vars_mu, rip = load_binary()
 devirt_mu, rip = load_binary()
